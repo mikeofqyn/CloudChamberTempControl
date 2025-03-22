@@ -1,7 +1,9 @@
 #include <Arduino.h>
 /*
  * 
- * Cloud Chamber Temperature Control
+ * Cloud Chamber Temperature Control with DS18B20 sensors and Peltier coolers
+ * 
+ * v2 - 2021-09-12 
  */
   
 //
@@ -22,8 +24,8 @@
 #define PIN_ONE_WIRE_BUS   2      // One or more DS18B20 sensors Dallas Library
 //
 #define PIN_CONFIG_BUTTON  3      // Config mode on-off (rotary encoder pushbutton)
-#define PIN_ENCODER_A      4      // Rotary encoder A 
-#define PIN_ENCODER_B      5      // Rotary encoder B
+#define PIN_ENCODER_A      5      // Rotary encoder A 
+#define PIN_ENCODER_B      4      // Rotary encoder B
 //
 #define PIN_PUMP_RELAY     6      // Commpressor pump on/off relay 
 #define PIN_COOLER_RELAY   7      // Cooler on/off relay
@@ -38,7 +40,7 @@ unsigned long MAIN_LOOP_DELAY = 10; // SLEEPING TIME BETWEEN LOOPS
 // 
 #include <EEPROM.h>
 
-const unsigned long EEPROM_MAGIC_NUMBER = 100100001; //  
+const unsigned long EEPROM_MAGIC_NUMBER = 100100002; //  V2
 
 // Limits
 const float  MAX_TARGET_TEMP   =   50.0;   // Reject target temperature greater than 1 degree Celsius
@@ -46,12 +48,15 @@ const float  MIN_TARGET_TEMP   =  -99.0;   // Reject target pressure less than -
 const float  MAX_COOLER_TEMP   =   50.0;   // Stop pump if temperature reaches 50 degrees Celsius on the cold side
 
 const float  DEFAULT_TARGET_TEMP =  -20.0;  // Default target temperature
+const int    DEFAULT_CONTROL_SENSOR = 0;    // Default sensor used to control cooler
 
 bool EEPROM_valid = false;
 
 struct config_data_s {  // V4
   unsigned long   magic_number;
   float           target_temp;
+  int             control_sensor;  // Index of sensor used to control cooler
+  int             paused;
 };
 
 struct config_data_s GL_config_data;
@@ -65,11 +70,8 @@ bool updateEEPROMConfig();  // Save configuration from EEPRO (forward)
 //
 // 0-Normal operation 
 // 1-Configure target temperature
-// 2-Configure max temp
-// 3-Configure pressure sensor presure range (max pressure) 
-// 4-Configure restart temp ( < max temp  )
-// 5-Configure max running time
-// 6-Configure rest time
+// 2-Configure index (0 - n-1) of the controlling tmp sensor (must be found empirically)
+// 3-Configura pause (0/1)
 // 
 //
 // If max temperature is zero, then no temperature check is performed.
@@ -88,14 +90,13 @@ unsigned long GL_last_encoder_change = 0;   // time the encoder knob was last tu
 
 unsigned int GL_button_counter = 0;
 
-int GL_paused = 0; // 0=normal operation, 1=paused
-
 //
 // Display label for each parameter (config mode)
 //
 const char *GL_MODELABELS[] = {
       "** END CONFIG **",  // NOT USED
       "SET TARGET TEMP ",
+      "SET CNTRL SENSOR",
       "PAUSE (0/1)     " 
 };
 char INVALID_MODE_LABEL[] = "(INVALID MODE!)";
@@ -115,7 +116,6 @@ void handle_button_int()  {
     GL_button_counter ++;  
   }  
 }
-
 
 // Encoder interface, prompts user depending on the current GL_config_mode 
 // value and updates the corresponondig configuration parameter
@@ -170,7 +170,15 @@ OneWire oneWire(PIN_ONE_WIRE_BUS);
 DallasTemperature tempSensor(&oneWire);
 int GL_temp_sensor_count = 0;
 float GL_temperatures[8];  // Up to 8 sensors
-float GL_current_temperature = 0;   // Sensor 0 temperature (used to control cooler)
+
+// The DallasTemperature library enumerates (assigns an index to) each device in the order it 
+// discovers them on the 1-Wire bus, which is not guaranteed to be consistent across resets or
+// reconnects. Each DS18B20s sensor each have a unique 64-bit address. One should rely on this 
+// address to reliably identify each sensor, but a complex configuration routine would be needed.
+// For now, we will use the index assigned by the library to identify each sensor and allow the
+// user to configure which index corresponds to the controlling sensor.
+
+float GL_current_temperature = 0;   // Controlling sensor temperature (used to control cooler)
 
 const unsigned long TMP_MEASUREMENT_INTERVAL = 1000;  // 1s 
 unsigned long GL_last_tmp_measurement_time = 0; // Use millis() after each read
@@ -196,7 +204,6 @@ inline void switchCooler(bool onoff)    {     // Switch cooler on/off
 void displayConfig();
 
 
-
 //
 //----------------------------------------------------------------------------------
 // Initial configuration
@@ -205,6 +212,8 @@ void displayConfig();
 void setDefaultConfig() {
       GL_config_data.magic_number = EEPROM_MAGIC_NUMBER;
       GL_config_data.target_temp = DEFAULT_TARGET_TEMP; // Target temperature
+      GL_config_data.control_sensor = 0;  // Sensor used to control cooler
+      GL_config_data.paused = 0;  // 0=normal operation, 1=paused
 };
 
 
@@ -356,12 +365,11 @@ void loop() {
       for (int i = 0; i < GL_temp_sensor_count; i++) {
         GL_temperatures[i] = tempSensor.getTempCByIndex(i);
       }
-      GL_current_temperature = tempSensor.getTempCByIndex(0);
+      // Update measured temperature as control sensor temperature
+      GL_current_temperature = tempSensor.getTempCByIndex(GL_config_data.control_sensor);
     }
     GL_last_tmp_measurement_time = millis();
   }
-
-
 
   //
   // Turn cooler on/off according to temperature
@@ -377,7 +385,7 @@ void loop() {
   bool prev_cooler_state = GL_cooler_state;
 
   // --- If paused, turn / keep off pump and cooler
-  if (GL_paused) {
+  if (GL_config_data.paused) {
     if (GL_pump_state) {
       switchPump(false);
     } 
@@ -455,8 +463,8 @@ void updateLCD() {
 //
 //       0123456789012345
 //      +----------------+
-//    0 |TMP -99.0 COOLER|  (PAGE 1)
-//    1 |SET -99.9   OFF |  (or ON or PAUSED)
+//    0 |TMP -99.0 [@n]  |  (PAGE 1)              [@n] -> Controlling sensor or N/A
+//    1 |SET -99.9 C:OFF |  (or ON or PAUSED)
 //      +----------------+
 //    0 |0:-99.9  2:-99.9|  (PAGE 2)
 //    1 |1:-99.9  3:-99.9|  (or ON)
@@ -465,7 +473,7 @@ void updateLCD() {
 //
 void LCD_refresh()
 {
-  char buf[17];      // buffer for max 16 char display
+  char buf[18];      // buffer for max 16 char display
   char fltbuf1[14];  // float buffer for dtostrf() (arduino's snprintf does not handle floats well)
   char fltbuf2[14];
 
@@ -481,16 +489,20 @@ void LCD_refresh()
   const char *tmpstr = GL_temp_sensor_count < 1?  notavail : fltbuf1;
   const char *setstr = abs(setT) > 99.9?  outofrange : fltbuf2;
 
+  char buf2[6];
+  snprintf(buf2, sizeof(buf2), "[%d]", (int)GL_config_data.control_sensor);
+  const char *strC = GL_temp_sensor_count < 1? buf2: "N/A";
+
   if (page1) {
     // Page 1 
-    // first line
-    snprintf(buf, sizeof(buf), "TMP:%s  COOLR",tmpstr);     
+    // first line               ....:....1....:....2....:....3....:....4....:....5....:....6....:....7....:....8
+    snprintf(buf, sizeof(buf), "TMP:%s %s   ",tmpstr, strC);     
     lcd.setCursor(0,0);  // char 0, line 0
     lcd.print(buf);
     Serial.println(buf);  
     // second line
     lcd.setCursor(0,1);  // char 0, line 1
-    const char *statestr = GL_paused? "PAUSED": GL_cooler_state? "   ON ": "  OFF ";
+    const char *statestr = GL_config_data.paused? "PAUSED": GL_cooler_state? " RUN  ": " *OFF*";
     snprintf(buf, sizeof(buf), "SET:%s %s ", setstr, statestr);
     lcd.print(buf);
     Serial.println(buf);
@@ -569,7 +581,10 @@ bool updateEEPROMConfig() {
   struct config_data_s conf2;
   EEPROM.put(0, GL_config_data);
   EEPROM.get(0, conf2);
-  EEPROM_valid = ((GL_config_data.magic_number == conf2.magic_number) && (GL_config_data.target_temp == conf2.target_temp));
+  EEPROM_valid = ((GL_config_data.magic_number == conf2.magic_number) && 
+                  (GL_config_data.target_temp == conf2.target_temp) &&
+                  (GL_config_data.control_sensor == conf2.control_sensor) &&
+                  (GL_config_data.paused == conf2.paused));
   return EEPROM_valid;
 }
 
@@ -597,7 +612,12 @@ void prepare_config_interface(int mode) {
       GL_value_min = MIN_TARGET_TEMP;
       break;
     case 2:
-      GL_value_set = GL_paused;
+      GL_value_set = (int) GL_config_data.control_sensor;
+      GL_value_max = GL_temp_sensor_count - 1;
+      GL_value_min = 0;
+      break;
+    case 3:
+      GL_value_set = GL_config_data.paused;
       GL_value_max = 1;
       GL_value_min = 0;
       break;
@@ -621,6 +641,7 @@ void prepare_config_interface(int mode) {
 // Config mode is changed 0-1-2-3-4-0 using the config button ()
 //    0-Normal operation 
 //    1-Configure target temperature
+//    2-Configure controlling temp sensor index
 //    2-pause on/off (1/0)
 //
 
@@ -678,7 +699,8 @@ void read_encoder(int mode) {
     }
     switch (mode) {
       case 1: GL_config_data.target_temp        =  GL_value_set; break;
-      case 2: GL_paused                         =  GL_value_set; break;
+      case 2: GL_config_data.control_sensor     =  GL_value_set; break;
+      case 3: GL_config_data.paused                         =  GL_value_set; break;
       default: break; 
     }
     show_value(GL_value_set);
@@ -702,6 +724,7 @@ void read_encoder(int mode) {
 void displayConfig() {
   Serial.print("Magic_number (Version ID).........: "); Serial.println(GL_config_data.magic_number    );
   Serial.print("Target temperature (Celsius)......: "); Serial.println(GL_config_data.target_temp     );
-  Serial.print("Paused............................: "); Serial.println(GL_paused);
+  Serial.print("Control sensor....................: "); Serial.println(GL_config_data.control_sensor   );
+  Serial.print("Paused............................: "); Serial.println(GL_config_data.paused);
   return;
 }
